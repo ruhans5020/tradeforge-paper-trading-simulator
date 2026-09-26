@@ -12,21 +12,37 @@ class ExecutionConfig:
 
 
 def simulate_fill(order: Order, last_price: float, available_volume: int, cfg: ExecutionConfig) -> Fill | None:
-    if order.remaining <= 0:
+    """Apply a simplified, deterministic market microstructure model."""
+    if order.remaining <= 0 or order.status in {OrderStatus.CANCELLED, OrderStatus.REJECTED}:
         return None
 
+    side = order.side.lower()
+    side_sign = 1 if side == "buy" else -1
+
+    if order.order_type in {OrderType.STOP, OrderType.STOP_LIMIT}:
+        if order.stop_price is None:
+            order.status = OrderStatus.REJECTED
+            order.reason = "Stop order requires a stop price"
+            return None
+        triggered = last_price >= order.stop_price if side == "buy" else last_price <= order.stop_price
+        if not triggered:
+            return None
+        # Once triggered, a stop becomes a market order or a limit order.
+        effective_type = OrderType.LIMIT if order.order_type == OrderType.STOP_LIMIT else OrderType.MARKET
+    else:
+        effective_type = order.order_type
+
     half_spread = last_price * cfg.spread_bps / 20_000
-    side_sign = 1 if order.side.lower() == "buy" else -1
     base = last_price + side_sign * half_spread
 
-    if order.order_type == OrderType.LIMIT:
+    if effective_type == OrderType.LIMIT:
         if order.limit_price is None:
             order.status = OrderStatus.REJECTED
             order.reason = "Limit order requires a limit price"
             return None
-        if order.side.lower() == "buy" and base > order.limit_price:
+        if side == "buy" and base > order.limit_price:
             return None
-        if order.side.lower() == "sell" and base < order.limit_price:
+        if side == "sell" and base < order.limit_price:
             return None
         base = min(base, order.limit_price) if side_sign > 0 else max(base, order.limit_price)
 
@@ -42,4 +58,11 @@ def simulate_fill(order: Order, last_price: float, available_volume: int, cfg: E
     order.average_fill_price = (prior + price * qty) / order.filled_quantity
     order.status = OrderStatus.FILLED if order.remaining == 0 else OrderStatus.PARTIALLY_FILLED
 
-    return Fill(order.symbol, order.side, qty, price, commission=commission, slippage=abs(price - last_price) * qty)
+    return Fill(
+        order.symbol,
+        side,
+        qty,
+        price,
+        commission=commission,
+        slippage=abs(price - last_price) * qty,
+    )
